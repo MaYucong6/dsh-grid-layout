@@ -1,0 +1,16 @@
+# Bundle patch for dsh-grid-layout.
+#
+# 作用：让本包成为 PROFILE 的一层（layer），而不是一个「装了但什么都不做」的惰性依赖。
+#
+# package.json 里声明 `dsh.bundle.patch` 之后，执行
+#
+#   dsh plugin --profile desktop add dsh-grid-layout
+#
+# 时 DSH 会把 dsh.profile.bundles 与已安装包做对账：声明了 `dsh.bundle.patch` 的依赖
+# 会加入 layer 栈，并由下面这条 insert 行把插件挂载进 profile。
+# 若缺少本文件，包能被安装但不会生效，DSH 只会给出 "declares no dsh.bundle" 警告。
+#
+# 结构对齐官方/社区 bundle patch（如 dsh-boot-animation）。
+- insert:
+    - id: dsh-grid-layout
+      name: dsh-grid-layout

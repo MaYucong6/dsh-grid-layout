@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DSH 格子化布局 · Demo（零依赖）</title>
+<!--
+  本 Demo 不加载任何外部资源（无 CDN / 无框架），双击即可运行。
+  布局引擎与 src/core/layout.ts 是同一套算法，仅渲染层改为原生 DOM。
+-->
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; }
+  .hint { color: rgba(255,255,255,.9); text-align: center; padding: 18px 16px 6px; font-size: 13px; line-height: 1.7; }
+  .hint b { color: #fff; }
+  .diag { display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 999px;
+    background: rgba(255,255,255,.22); font-size: 12px; }
+  .canvas { position: relative; width: 100%; max-width: 1200px; margin: 0 auto; padding: 0 8px 64px; }
+  .toolbar { position: sticky; top: 0; z-index: 10; display: flex; gap: 8px; align-items: center;
+    padding: 12px 8px; flex-wrap: wrap; }
+  .toolbar button { border: 1px solid rgba(255,255,255,.45); border-radius: 8px; padding: 7px 14px;
+    background: rgba(255,255,255,.2); color: #fff; cursor: pointer; font-size: 13px;
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+  .toolbar button:hover { background: rgba(255,255,255,.35); }
+  .toolbar .count { color: rgba(255,255,255,.85); font-size: 12px; margin-left: auto; }
+  .grid { position: relative; width: 100%; }
+  .box { position: absolute; top: 0; left: 0; display: flex; flex-direction: column;
+    border: 1px solid rgba(255,255,255,.42); border-radius: 14px; overflow: hidden;
+    background: rgba(255,255,255,.18);
+    backdrop-filter: blur(20px) saturate(160%); -webkit-backdrop-filter: blur(20px) saturate(160%);
+    box-shadow: 0 10px 30px rgba(0,0,0,.22); transition: box-shadow .15s ease; color: #fff;
+    will-change: transform; }
+  .box:hover { box-shadow: 0 14px 40px rgba(0,0,0,.32); }
+  .box.collapsed { border-radius: 10px; }
+  .titlebar { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 7px 12px; cursor: grab; user-select: none; -webkit-user-select: none; touch-action: none;
+    font-size: 13px; font-weight: 600; border-bottom: 1px solid rgba(255,255,255,.25); flex: 0 0 auto; }
+  .titlebar:active { cursor: grabbing; }
+  .fold { opacity: .7; font-size: 11px; }
+  .body { flex: 1 1 auto; overflow: auto; font-size: 13px; }
+  .note { display: block; width: 100%; height: 100%; border: none; background: transparent;
+    resize: none; outline: none; font: inherit; color: #fff; padding: 10px 12px; }
+  .note::placeholder { color: rgba(255,255,255,.55); }
+  .shortcuts { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; }
+  .shortcut { text-align: left; border: 1px solid rgba(255,255,255,.35); border-radius: 8px;
+    background: rgba(255,255,255,.12); color: #fff; padding: 7px 11px; cursor: pointer; font-size: 13px; }
+  .shortcut:hover { background: rgba(255,255,255,.25); }
+  .metric { font-size: 26px; font-weight: 700; text-align: center; padding-top: 14px; }
+  .metric-label { opacity: .7; font-size: 12px; text-align: center; padding: 4px 12px 12px; }
+  .resize { position: absolute; right: 0; bottom: 0; width: 20px; height: 20px;
+    cursor: nwse-resize; touch-action: none; }
+  .resize::after { content: ''; position: absolute; right: 5px; bottom: 5px; width: 9px; height: 9px;
+    border-right: 2px solid rgba(255,255,255,.85); border-bottom: 2px solid rgba(255,255,255,.85); }
+</style>
+</head>
+<body>
+
+<div class="hint">
+  拖拽<b>标题栏</b>移动 · <b>双击</b>标题栏折叠/展开 · 拖<b>右下角</b>调整大小 · 顶部按钮「一键整理 / 折叠全部 / 新建便签」
+  <span class="diag" id="diag">脚本未执行</span>
+</div>
+
+<div class="canvas">
+  <div class="toolbar">
+    <button id="btn-add">＋ 新建便签</button>
+    <button id="btn-tidy">⤒ 一键整理</button>
+    <button id="btn-collapse">▁ 折叠全部</button>
+    <span class="count" id="count"></span>
+  </div>
+  <div class="grid" id="grid"></div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  // 脚本执行自检：若这行没变成「脚本已执行」，说明当前环境拦截了内联脚本
+  document.getElementById('diag').textContent = '脚本已执行 ✓';
+
+  // ═══════════════════════════════════════════════════════════
+  //  1. 布局引擎（与 src/core/layout.ts 同一套算法）
+  // ═══════════════════════════════════════════════════════════
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+  function effRows(b) { return b.collapsed ? 1 : b.h; }
+  function rectOf(b) { return { x: b.x, y: b.y, w: b.w, h: effRows(b) }; }
+  function collides(a, b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+  function hitsAny(probe, others) {
+    var p = rectOf(probe);
+    for (var i = 0; i < others.length; i++) {
+      if (others[i].id !== probe.id && collides(p, rectOf(others[i]))) return true;
+    }
+    return false;
+  }
+  /** 从 startY 起找到第一个不冲突的行 */
+  function placeAt(box, startY, placed) {
+    var y = startY;
+    var probe = { id: box.id, x: box.x, y: y, w: box.w, h: box.h, collapsed: box.collapsed };
+    while (hitsAny(probe, placed)) { y++; probe.y = y; }
+    return y;
+  }
+  /** 冲突消解：pinned 格子钉住，其余向下让位 */
+  function resolveCollisions(boxes, pinnedId) {
+    var sorted = boxes.slice().sort(function (a, b) {
+      if (a.id === pinnedId) return -1;
+      if (b.id === pinnedId) return 1;
+      return (a.y - b.y) || (a.x - b.x);
+    });
+    var placed = [];
+    for (var i = 0; i < sorted.length; i++) {
+      var box = sorted[i];
+      placed.push(Object.assign({}, box, { y: placeAt(box, box.y, placed) }));
+    }
+    return placed;
+  }
+  /** 向上压实：消除空洞 */
+  function compactList(boxes) {
+    var sorted = boxes.slice().sort(function (a, b) { return (a.y - b.y) || (a.x - b.x); });
+    var placed = [];
+    for (var i = 0; i < sorted.length; i++) {
+      var box = sorted[i];
+      placed.push(Object.assign({}, box, { y: placeAt(box, 0, placed) }));
+    }
+    return placed;
+  }
+  function compact(layout) { return Object.assign({}, layout, { boxes: compactList(layout.boxes) }); }
+
+  function moveBox(layout, id, nx, ny) {
+    var box = null;
+    for (var i = 0; i < layout.boxes.length; i++) if (layout.boxes[i].id === id) box = layout.boxes[i];
+    if (!box) return layout;
+    var x = clamp(Math.round(nx), 0, layout.cols - box.w);
+    var y = Math.max(0, Math.round(ny));
+    if (x === box.x && y === box.y) return layout;
+    var others = layout.boxes.filter(function (b) { return b.id !== id; });
+    return Object.assign({}, layout, {
+      boxes: resolveCollisions(others.concat([Object.assign({}, box, { x: x, y: y })]), id)
+    });
+  }
+
+  function resizeBox(layout, id, nw, nh) {
+    var box = null;
+    for (var i = 0; i < layout.boxes.length; i++) if (layout.boxes[i].id === id) box = layout.boxes[i];
+    if (!box || box.collapsed) return layout;
+    var w = clamp(Math.round(nw), box.minW || 1, layout.cols - box.x);
+    var h = Math.max(box.minH || 1, Math.round(nh));
+    if (w === box.w && h === box.h) return layout;
+    var others = layout.boxes.filter(function (b) { return b.id !== id; });
+    return Object.assign({}, layout, {
+      boxes: resolveCollisions(others.concat([Object.assign({}, box, { w: w, h: h })]), id)
+    });
+  }
+
+  function setCollapsed(layout, id, collapsed) {
+    var box = null;
+    for (var i = 0; i < layout.boxes.length; i++) if (layout.boxes[i].id === id) box = layout.boxes[i];
+    if (!box || box.collapsed === collapsed) return layout;
+    var others = layout.boxes.filter(function (b) { return b.id !== id; });
+    var toggled = Object.assign({}, box, { collapsed: collapsed });
+    var boxes = collapsed
+      ? compactList([toggled].concat(others))                        // 折叠：向上压实，释放空间
+      : resolveCollisions(others.concat([toggled]), id);             // 展开：回原位，向下推开
+    return Object.assign({}, layout, { boxes: boxes });
+  }
+
+  function computeGeometry(layout, w) {
+    return {
+      colWidth: (w - layout.gap * (layout.cols + 1)) / layout.cols,
+      rowHeight: layout.rowHeight, gap: layout.gap, cols: layout.cols
+    };
+  }
+  function boxToPixels(box, geo) {
+    var rows = effRows(box);
+    return {
+      x: box.x * (geo.colWidth + geo.gap) + geo.gap,
+      y: box.y * (geo.rowHeight + geo.gap) + geo.gap,
+      w: box.w * geo.colWidth + (box.w - 1) * geo.gap,
+      h: rows * geo.rowHeight + (rows - 1) * geo.gap
+    };
+  }
+  function maxRow(layout) {
+    return layout.boxes.reduce(function (m, b) { return Math.max(m, b.y + effRows(b)); }, 0);
+  }
+  function findFreePosition(layout, w, h) {
+    var x = 0, y = maxRow(layout);
+    while (hitsAny({ id: '__probe__', x: x, y: y, w: w, h: h, collapsed: false }, layout.boxes)) y++;
+    return { x: x, y: y };
+  }
+  var seq = 0;
+  function uid() { return 'box-' + (++seq) + '-' + Math.random().toString(36).slice(2, 6); }
+
+  // ═══════════════════════════════════════════════════════════
+  //  2. 状态
+  // ═══════════════════════════════════════════════════════════
+  var state = {
+    cols: 12, rowHeight: 44, gap: 12,
+    boxes: [
+      { id: 'welcome', title: '欢迎使用', kind: 'note', collapsed: false,
+        props: { kind: 'note', note: { text: '双击标题栏可以一键「卷起」整个格子。\n\n· 拖标题栏移动\n· 拖右下角调整大小\n· 折叠后下方格子会自动上浮' } },
+        x: 0, y: 0, w: 4, h: 3, minW: 2, minH: 2 },
+      { id: 'todo', title: '待办', kind: 'note', collapsed: false,
+        props: { kind: 'note', note: { text: '- 体验拖拽碰撞让位\n- 试试「一键整理」\n- 试试「折叠全部」' } },
+        x: 4, y: 0, w: 4, h: 3, minW: 2, minH: 2 },
+      { id: 'quick', title: '快捷入口', kind: 'shortcuts', collapsed: false,
+        props: { kind: 'shortcuts', items: [
+          { id: 's1', label: '🗂 文件投影' }, { id: 's2', label: '📌 自动归类' }, { id: 's3', label: '📊 状态监控' } ] },
+        x: 8, y: 0, w: 4, h: 3, minW: 2, minH: 2 },
+      { id: 'mon', title: '状态监控', kind: 'monitor', collapsed: false,
+        props: { kind: 'monitor', monitor: { metric: '● 正常', label: '接入 DSH 后由 Provider 注入实时数据' } },
+        x: 0, y: 3, w: 6, h: 2, minW: 2, minH: 2 },
+      { id: 'fold', title: '点我双击试试折叠', kind: 'note', collapsed: false,
+        props: { kind: 'note', note: { text: '折叠后只留一条标题栏，下方格子会自动上浮回收空间。' } },
+        x: 6, y: 3, w: 6, h: 2, minW: 2, minH: 2 }
+    ]
+  };
+
+  var gridEl = document.getElementById('grid');
+  var countEl = document.getElementById('count');
+  var boxEls = Object.create(null);   // id -> element（DOM 复用，避免全量重建）
+
+  function currentGeo() { return computeGeometry(state, gridEl.clientWidth); }
+  function boxById(id) {
+    for (var i = 0; i < state.boxes.length; i++) if (state.boxes[i].id === id) return state.boxes[i];
+    return null;
+  }
+  function setState(next) { state = next; render(); }
+
+  // ═══════════════════════════════════════════════════════════
+  //  3. 渲染（复用已有 DOM 节点，只更新几何与内容）
+  // ═══════════════════════════════════════════════════════════
+  function render() {
+    var w = gridEl.clientWidth;
+    if (w <= 0) return;
+    var geo = currentGeo();
+    gridEl.style.height = (maxRow(state) * (geo.rowHeight + geo.gap) + geo.gap) + 'px';
+    countEl.textContent = state.boxes.length + ' 个格子';
+
+    var seen = Object.create(null);
+    state.boxes.forEach(function (box) {
+      seen[box.id] = true;
+      var el = boxEls[box.id];
+      if (!el) { el = createBoxEl(box); boxEls[box.id] = el; gridEl.appendChild(el); }
+      updateBoxEl(el, box, geo);
+    });
+    Object.keys(boxEls).forEach(function (id) {
+      if (!seen[id]) { boxEls[id].remove(); delete boxEls[id]; }
+    });
+  }
+
+  function createBoxEl(box) {
+    var el = document.createElement('div');
+    el.className = 'box';
+    el.dataset.id = box.id;
+
+    var bar = document.createElement('div');
+    bar.className = 'titlebar';
+    bar.title = '拖拽移动 · 双击折叠/展开';
+    var title = document.createElement('span');
+    var fold = document.createElement('span');
+    fold.className = 'fold';
+    bar.appendChild(title); bar.appendChild(fold);
+
+    var body = document.createElement('div');
+    body.className = 'body';
+
+    var handle = document.createElement('div');
+    handle.className = 'resize';
+    handle.title = '拖拽调整大小';
+
+    el.appendChild(bar); el.appendChild(body); el.appendChild(handle);
+    el._refs = { bar: bar, title: title, fold: fold, body: body, handle: handle };
+
+    attachDrag(el, bar, box.id);
+    attachResize(el, handle, box.id);
+    return el;
+  }
+
+  function updateBoxEl(el, box, geo) {
+    var px = boxToPixels(box, geo);
+    el.style.transform = 'translate3d(' + px.x + 'px,' + px.y + 'px,0)';
+    el.style.width = px.w + 'px';
+    el.style.height = px.h + 'px';
+    el.classList.toggle('collapsed', !!box.collapsed);
+
+    var r = el._refs;
+    r.title.textContent = box.title;
+    r.fold.textContent = box.collapsed ? '▸' : '▾';
+
+    if (box.collapsed) { r.body.style.display = 'none'; r.handle.style.display = 'none'; return; }
+    r.body.style.display = ''; r.handle.style.display = '';
+    renderBody(r.body, box);
+  }
+
+  function renderBody(body, box) {
+    if (body.dataset.kind !== box.kind) {
+      body.textContent = '';
+      body.dataset.kind = box.kind;
+      if (box.kind === 'note') {
+        var ta = document.createElement('textarea');
+        ta.className = 'note';
+        ta.placeholder = '写点什么…';
+        var id = box.id;
+        ta.addEventListener('input', function () {
+          // 就地更新状态，不触发重渲染，避免光标跳动
+          state = Object.assign({}, state, {
+            boxes: state.boxes.map(function (b) {
+              return b.id === id ? Object.assign({}, b, { props: { kind: 'note', note: { text: ta.value } } }) : b;
+            })
+          });
+        });
+        body.appendChild(ta);
+      } else if (box.kind === 'shortcuts') {
+        var wrap = document.createElement('div');
+        wrap.className = 'shortcuts';
+        box.props.items.forEach(function (it) {
+          var btn = document.createElement('button');
+          btn.className = 'shortcut';
+          btn.textContent = it.label;
+          btn.addEventListener('click', function () {
+            alert('Demo 占位：打开「' + it.label + '」\n（接入 DSH 后由 Host 端执行真实动作）');
+          });
+          wrap.appendChild(btn);
+        });
+        body.appendChild(wrap);
+      } else if (box.kind === 'monitor') {
+        var m = document.createElement('div');
+        m.className = 'metric';
+        m.textContent = box.props.monitor.metric;
+        var l = document.createElement('div');
+        l.className = 'metric-label';
+        l.textContent = box.props.monitor.label;
+        body.appendChild(m); body.appendChild(l);
+      }
+    }
+    // 便签文本同步（聚焦时不覆盖，避免打断输入）
+    if (box.kind === 'note') {
+      var ta2 = body.querySelector('textarea');
+      if (ta2 && document.activeElement !== ta2 && ta2.value !== box.props.note.text) {
+        ta2.value = box.props.note.text;
+      }
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  //  4. 交互：拖拽 / 缩放（Pointer Capture + rAF 节流）
+  // ═══════════════════════════════════════════════════════════
+  function attachDrag(el, bar, id) {
+    var drag = null;
+    bar.addEventListener('pointerdown', function (e) {
+      if (e.button !== 0) return;
+      bar.setPointerCapture(e.pointerId);
+      var box = boxById(id);
+      drag = { pid: e.pointerId, sx: e.clientX, sy: e.clientY, x0: box.x, y0: box.y, raf: 0 };
+    });
+    bar.addEventListener('pointermove', function (e) {
+      if (!drag || e.pointerId !== drag.pid) return;
+      var geo = currentGeo();
+      var nx = drag.x0 + Math.round((e.clientX - drag.sx) / (geo.colWidth + geo.gap));
+      var ny = drag.y0 + Math.round((e.clientY - drag.sy) / (geo.rowHeight + geo.gap));
+      if (drag.raf) return;                       // 一帧只提交一次
+      drag.raf = requestAnimationFrame(function () {
+        drag.raf = 0;
+        setState(moveBox(state, id, nx, ny));
+      });
+    });
+    function end(e) { if (drag && e.pointerId === drag.pid) drag = null; }
+    bar.addEventListener('pointerup', end);
+    bar.addEventListener('pointercancel', end);
+    bar.addEventListener('dblclick', function () {
+      var box = boxById(id);
+      setState(setCollapsed(state, id, !box.collapsed));
+    });
+  }
+
+  function attachResize(el, handle, id) {
+    var rs = null;
+    handle.addEventListener('pointerdown', function (e) {
+      e.stopPropagation(); e.preventDefault();
+      handle.setPointerCapture(e.pointerId);
+      var box = boxById(id);
+      rs = { pid: e.pointerId, sx: e.clientX, sy: e.clientY, w0: box.w, h0: box.h, raf: 0 };
+    });
+    handle.addEventListener('pointermove', function (e) {
+      if (!rs || e.pointerId !== rs.pid) return;
+      var geo = currentGeo();
+      var nw = rs.w0 + Math.round((e.clientX - rs.sx) / (geo.colWidth + geo.gap));
+      var nh = rs.h0 + Math.round((e.clientY - rs.sy) / (geo.rowHeight + geo.gap));
+      if (rs.raf) return;
+      rs.raf = requestAnimationFrame(function () {
+        rs.raf = 0;
+        setState(resizeBox(state, id, nw, nh));
+      });
+    });
+    function end(e) { if (rs && e.pointerId === rs.pid) rs = null; }
+    handle.addEventListener('pointerup', end);
+    handle.addEventListener('pointercancel', end);
+  }
+
+  // 标题栏 / 缩放手柄的 hover 由 CSS 处理；双击折叠在 attachDrag 内绑定
+
+  // ═══════════════════════════════════════════════════════════
+  //  5. 工具条 + 初始化
+  // ═══════════════════════════════════════════════════════════
+  document.getElementById('btn-add').addEventListener('click', function () {
+    var pos = findFreePosition(state, 4, 3);
+    setState(Object.assign({}, state, {
+      boxes: state.boxes.concat([{
+        id: uid(), title: '新便签', kind: 'note', collapsed: false,
+        props: { kind: 'note', note: { text: '' } },
+        x: pos.x, y: pos.y, w: 4, h: 3, minW: 2, minH: 2
+      }])
+    }));
+  });
+  document.getElementById('btn-tidy').addEventListener('click', function () {
+    setState(compact(state));
+  });
+  document.getElementById('btn-collapse').addEventListener('click', function () {
+    var next = state;
+    state.boxes.slice().forEach(function (b) {
+      if (!b.collapsed) next = setCollapsed(next, b.id, true);
+    });
+    setState(next);
+  });
+
+  if (window.ResizeObserver) new ResizeObserver(render).observe(gridEl);
+  render();
+})();
+</script>
+</body>
+</html>
